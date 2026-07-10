@@ -15,9 +15,10 @@ The steps mirror the ``flare_pipeline.ipynb`` / ``flare_frizzle.ipynb`` notebook
   3. Resample every spectrum onto a single common wavelength grid using one of
      several interchangeable schemes (``--method``).
   4. Optionally combine the three science traces (``--trace ALL``).
-  5. Write an ``.npz`` file with the same layout as the notebooks:
+  5. Write an ``.npz`` file with the same layout as the notebooks (plus eflux):
         wave     (norder, npix)             common wavelength grid
         flux     (nspec, norder, npix)      resampled flux
+        eflux    (nspec, norder, npix)      1-sigma flux uncertainty
         bjd      (nspec,)                    barycentric/heliocentric JD
         texp     (nspec,)                    exposure time [s]
         filename (nspec,)                    source L1 file paths
@@ -682,12 +683,8 @@ def parse_args(argv=None):
     p.add_argument(
         "-o", "--output", default=None,
         help="output .npz filename or path "
-             "(default: socal_spectra_{date}_{trace}_{method}_common_wavegrid.npz "
+             "(default: socal_spectra_{date}_{trace}_{method}.npz "
              "inside --outdir)",
-    )
-    p.add_argument(
-        "--save-errors", action="store_true",
-        help="also store the resampled flux errors under key 'eflux'",
     )
     p.add_argument("-q", "--quiet", action="store_true", help="less output")
     return p.parse_args(argv)
@@ -769,7 +766,7 @@ def main(argv=None):
     )
     output = args.output or (
         f"socal_spectra_{args.date}_{args.trace}_{scheme}"
-        "_common_wavegrid.npz"
+        ".npz"
     )
     # Place the file in --outdir unless the user gave --output with its own
     # directory. Create whatever directory we end up writing into.
@@ -778,19 +775,23 @@ def main(argv=None):
     outdir = os.path.dirname(output)
     if outdir:
         os.makedirs(outdir, exist_ok=True)
+    # eflux is the 1-sigma flux uncertainty on the common grid, propagated
+    # through the resampling for every method (frizzle: sqrt of the covariance
+    # diagonal; spectres: its own error output; cubic: interpolated variance;
+    # ALL: combined in quadrature).
     out = dict(
         wave=common_grid,
         flux=flux,
+        eflux=err,
         bjd=data["bjds"],
         texp=data["texps"],
         filename=data["files"],
     )
-    if args.save_errors:
-        out["eflux"] = err
     np.savez(output, **out)
     print(f"Wrote {output}")
     print(f"  wave {out['wave'].shape}, flux {out['flux'].shape}, "
-          f"bjd {out['bjd'].shape}, texp {out['texp'].shape}")
+          f"eflux {out['eflux'].shape}, bjd {out['bjd'].shape}, "
+          f"texp {out['texp'].shape}")
     return 0
 
 

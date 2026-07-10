@@ -22,8 +22,11 @@ When `--trace ALL`, choose how the traces are combined:
   is ignored)
 
 Output `.npz` layout: `wave (norder, npix)`,
-`flux (nspec, norder, npix)`, `bjd (nspec,)`, `texp (nspec,)`,
-`filename (nspec,)`.
+`flux (nspec, norder, npix)`, `eflux (nspec, norder, npix)`, `bjd (nspec,)`,
+`texp (nspec,)`, `filename (nspec,)`. `eflux` is the 1-sigma flux uncertainty
+propagated through the resampling for every method (frizzle: sqrt of the
+covariance diagonal; spectres: its error output; cubic: interpolated variance;
+`ALL`: combined in quadrature / from the joint frizzle fit).
 
 ## Environment
 
