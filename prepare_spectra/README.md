@@ -43,8 +43,17 @@ uv run python prepare_spectra.py --date 20240808 --trace SCI2 --method spectres
 uv run python prepare_spectra.py --date 20240808 --trace SCI2 --method frizzle
 uv run python prepare_spectra.py --date 20240808 --trace ALL  --combine sum --method cubic
 uv run python prepare_spectra.py --date 20240808 --trace ALL  --combine frizzle
+uv run python prepare_spectra.py --date 20240808 --method frizzle --nproc 8
 uv run python prepare_spectra.py --help
 ```
+
+Orders are resampled independently, so `--nproc N` fans them out over `N`
+worker processes (a batch of `N` orders at a time); the default `--nproc 1`
+runs serially. This helps most with `--method frizzle` and `--combine frizzle`,
+which are the expensive schemes.
+
+Output is written to `--outdir` (default `outputs/`, created if missing); pass
+`-o` with a directory to override that location.
 
 L1 files are looked up under `$DATADIR/kpf/L1/<date>` and the clear-sky
 selection under `$BASEDIR/solar_csvs/kpf/<year>/<date>_socal_rvs.csv` (override

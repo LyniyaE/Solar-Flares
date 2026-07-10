@@ -260,11 +260,24 @@ def make_frizzle_resampler(n_modes=None):
     return resample_frizzle
 
 
-METHODS = {
-    "spectres": lambda args: resample_spectres,
-    "cubic": lambda args: resample_cubic,
-    "frizzle": lambda args: make_frizzle_resampler(args.n_modes),
-}
+METHOD_NAMES = ("spectres", "cubic", "frizzle")
+
+
+def make_resampler(method, n_modes=None):
+    """
+    Return a ``resample(w_out, w, f, v)`` callable for the named ``method``.
+
+    Built from a plain string (not a closure), so worker processes can
+    reconstruct the resampler locally rather than pickling it -- important for
+    ``frizzle``, whose resampler closes over an imported ``jax``/``frizzle``.
+    """
+    if method == "spectres":
+        return resample_spectres
+    if method == "cubic":
+        return resample_cubic
+    if method == "frizzle":
+        return make_frizzle_resampler(n_modes)
+    raise ValueError(f"unknown method: {method!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -289,44 +302,167 @@ def fill_edge_nans(flux):
 
 # ---------------------------------------------------------------------------
 # 5. Core: shift to heliocentric frame + resample onto the common grid
+#
+# Each order is resampled independently, so orders can be processed in parallel.
+# The heavy loops all funnel through the array-level helpers below; the trace
+# drivers fan them out over ``nproc`` worker processes (a batch of nproc orders
+# runs at a time), or run serially in-process when ``nproc <= 1``.
 # ---------------------------------------------------------------------------
+def _resample_order_arrays(w, f, v, bcvel, w_out, resample):
+    """
+    Shift + resample one order across every epoch.
+
+    ``w``, ``f``, ``v`` have shape (nspec, npix_in); ``bcvel`` has shape
+    (nspec,); ``w_out`` has shape (npix_out,). Returns (nspec, npix_out) arrays.
+    """
+    nspec, npix = f.shape[0], len(w_out)
+    flux_out = np.empty((nspec, npix))
+    err_out = np.empty((nspec, npix))
+    for j in range(nspec):
+        # Shift to heliocentric frame: lambda_helio = lambda * (1 + v_bc/c)
+        w_shift = w[j] * (1.0 + bcvel[j] / SPEED_OF_LIGHT)
+        fo, eo = resample(w_out, w_shift, f[j], v[j])
+        flux_out[j] = fill_edge_nans(fo)
+        err_out[j] = eo
+    return flux_out, err_out
+
+
+def _frizzle_stack_arrays(w, f, v, bcvel, w_out, n_modes=None):
+    """
+    Combine all traces of one order across every epoch by forward-modeling them
+    together with frizzle (a single frizzle call per epoch over the concatenated,
+    BC-shifted trace pixels).
+
+    ``w``, ``f``, ``v`` have shape (nspec, ntrace, npix_in); ``bcvel`` (nspec,).
+    Returns (nspec, npix_out) arrays.
+    """
+    import jax
+
+    jax.config.update("jax_enable_x64", True)
+    import frizzle
+
+    nspec, ntrace = f.shape[0], f.shape[1]
+    npix = len(w_out)
+    nm = n_modes if n_modes is not None else (int(npix // 3) | 1)
+    w_out = np.asarray(w_out)
+
+    flux_out = np.empty((nspec, npix))
+    err_out = np.empty((nspec, npix))
+    for j in range(nspec):
+        ws, fs, ivs = [], [], []
+        for tr in range(ntrace):
+            # Same per-order BC velocity for every trace (BARYVEL is per order).
+            ws.append(w[j, tr] * (1.0 + bcvel[j] / SPEED_OF_LIGHT))
+            fs.append(f[j, tr])
+            ivs.append(1.0 / v[j, tr])
+        W = np.hstack(ws)
+        F = np.hstack(fs)
+        IV = np.hstack(ivs)
+        idx = np.argsort(W)
+        y_star, C_star, _flags, _meta = frizzle.frizzle(
+            w_out, np.asarray(W[idx]), np.asarray(F[idx]),
+            np.asarray(IV[idx]), n_modes=nm,
+        )
+        y_star = np.asarray(y_star)
+        C_star = np.asarray(C_star)
+        var = np.diag(C_star) if C_star.ndim == 2 else C_star
+        flux_out[j] = fill_edge_nans(y_star)
+        err_out[j] = np.sqrt(np.where(var < 0, 0.0, var))
+    return flux_out, err_out
+
+
+# -- worker functions (module level so they are picklable for multiprocessing) --
+def _resample_order_job(job):
+    resample = make_resampler(job["method"], job["n_modes"])
+    fo, eo = _resample_order_arrays(
+        job["w"], job["f"], job["v"], job["bcvel"], job["w_out"], resample
+    )
+    return job["o"], fo, eo
+
+
+def _frizzle_stack_job(job):
+    fo, eo = _frizzle_stack_arrays(
+        job["w"], job["f"], job["v"], job["bcvel"], job["w_out"], job["n_modes"]
+    )
+    return job["o"], fo, eo
+
+
+def _map_orders(jobs, worker, nproc, verbose, label):
+    """
+    Run ``worker`` on each per-order job, yielding results as they finish.
+
+    ``nproc <= 1`` runs serially in-process; otherwise a spawn-based process
+    pool processes the orders ``nproc`` at a time. Results may arrive out of
+    order, so each carries its order index ``o``.
+    """
+    n = len(jobs)
+    if nproc is None or nproc <= 1:
+        for k, job in enumerate(jobs):
+            res = worker(job)
+            if verbose:
+                print(f"  {label} {k + 1}/{n}")
+            yield res
+        return
+
+    import multiprocessing as mp
+
+    # spawn (not fork): avoids fork-after-jax-init hangs in the frizzle workers.
+    # Each worker is pinned to a single BLAS/XLA thread (see _init_worker): the
+    # parallelism is across processes, so without this the nproc workers each
+    # grab every core and thrash -- making frizzle *slower* than serial.
+    ctx = mp.get_context("spawn")
+    with ctx.Pool(processes=nproc, initializer=_init_worker) as pool:
+        for k, res in enumerate(pool.imap_unordered(worker, jobs)):
+            if verbose:
+                print(f"  {label} {k + 1}/{n} (nproc={nproc})")
+            yield res
+
+
+def _init_worker():
+    """
+    Pin a pool worker to a single thread so ``nproc`` processes don't oversubscribe
+    the cores. Runs once per worker at startup, before any jax/BLAS work.
+    """
+    for var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+                "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+        os.environ[var] = "1"
+    # XLA reads this when the CPU client initializes (before the first frizzle
+    # call in this worker, since jax is imported lazily inside the job).
+    os.environ["XLA_FLAGS"] = (
+        os.environ.get("XLA_FLAGS", "")
+        + " --xla_cpu_multi_thread_eigen=false intra_op_parallelism_threads=1"
+    ).strip()
+    # numpy's BLAS is already loaded by the time this runs; limit it at runtime.
+    try:
+        import threadpoolctl
+
+        threadpoolctl.threadpool_limits(1)
+    except Exception:
+        pass
+
+
 def shift_and_resample_order(data, t, o, resample, w_out=None):
     """
     BC-shift a single trace/order to the heliocentric frame across every epoch
-    and resample onto the output grid ``w_out``.
+    and resample onto the output grid ``w_out`` using the ``resample`` callable.
 
     If ``w_out`` is None, the first-epoch wavelengths of this trace/order are
     used (sorted increasing). Returns arrays (nspec, npix): flux_out, err_out.
     """
-    waves = data["waves"]
-    fluxs = data["fluxs"]
-    varss = data["vars"]
-    bcvels = data["bcvels"]
-
     if w_out is None:
-        w_out = np.sort(waves[0, t, o])
-
-    nspec, npix = fluxs.shape[0], len(w_out)
-    flux_out = np.empty((nspec, npix))
-    err_out = np.empty((nspec, npix))
-
-    for j in range(nspec):
-        w = waves[j, t, o]
-        f = fluxs[j, t, o]
-        v = varss[j, t, o]
-        # Shift to heliocentric frame: lambda_helio = lambda * (1 + v_bc/c)
-        w_shift = w * (1.0 + bcvels[j, o] / SPEED_OF_LIGHT)
-        fo, eo = resample(w_out, w_shift, f, v)
-        flux_out[j] = fill_edge_nans(fo)
-        err_out[j] = eo
-
-    return flux_out, err_out
+        w_out = np.sort(data["waves"][0, t, o])
+    return _resample_order_arrays(
+        data["waves"][:, t, o], data["fluxs"][:, t, o], data["vars"][:, t, o],
+        data["bcvels"][:, o], w_out, resample,
+    )
 
 
-def shift_and_resample_trace(data, t, resample, common_grid, verbose=True):
+def shift_and_resample_trace(data, t, method, common_grid, n_modes=None,
+                             nproc=1, verbose=True):
     """
     For a single trace ``t``, BC-shift every epoch/order to the heliocentric
-    frame and resample onto ``common_grid`` (shape (norder, npix)).
+    frame and resample onto ``common_grid`` (shape (norder, npix)) using the
+    named ``method``. Orders are processed in parallel over ``nproc`` workers.
 
     Returns arrays (nspec, norder, npix): flux_out, err_out.
     """
@@ -334,13 +470,17 @@ def shift_and_resample_trace(data, t, resample, common_grid, verbose=True):
     flux_out = np.empty((nspec, norder, npix))
     err_out = np.empty((nspec, norder, npix))
 
-    for o in range(norder):
-        fo, eo = shift_and_resample_order(data, t, o, resample, w_out=common_grid[o])
+    jobs = [
+        dict(o=o, method=method, n_modes=n_modes,
+             w=data["waves"][:, t, o], f=data["fluxs"][:, t, o],
+             v=data["vars"][:, t, o], bcvel=data["bcvels"][:, o],
+             w_out=common_grid[o])
+        for o in range(norder)
+    ]
+    for o, fo, eo in _map_orders(jobs, _resample_order_job, nproc, verbose,
+                                 "resampled order"):
         flux_out[:, o] = fo
         err_out[:, o] = eo
-        if verbose:
-            print(f"  resampled order {o + 1}/{norder}")
-
     return flux_out, err_out
 
 
@@ -382,58 +522,34 @@ def frizzle_stack_traces(data, o, w_out, n_modes=None):
 
     Returns arrays (nspec, npix): flux_out, err_out.
     """
-    import jax
-
-    jax.config.update("jax_enable_x64", True)
-    import frizzle
-
-    waves = data["waves"]
-    fluxs = data["fluxs"]
-    varss = data["vars"]
-    bcvels = data["bcvels"]
-
-    nspec = fluxs.shape[0]
-    npix = len(w_out)
-    nm = n_modes if n_modes is not None else (int(npix // 3) | 1)
-    w_out = np.asarray(w_out)
-
-    flux_out = np.empty((nspec, npix))
-    err_out = np.empty((nspec, npix))
-    for j in range(nspec):
-        ws, fs, ivs = [], [], []
-        for t in range(NTRACE):
-            # Same per-order BC velocity for every trace (BARYVEL is per order).
-            w_bc = waves[j, t, o] * (1.0 + bcvels[j, o] / SPEED_OF_LIGHT)
-            ws.append(w_bc)
-            fs.append(fluxs[j, t, o])
-            ivs.append(1.0 / varss[j, t, o])
-        w = np.hstack(ws)
-        f = np.hstack(fs)
-        iv = np.hstack(ivs)
-        idx = np.argsort(w)
-        y_star, C_star, _flags, _meta = frizzle.frizzle(
-            w_out, np.asarray(w[idx]), np.asarray(f[idx]),
-            np.asarray(iv[idx]), n_modes=nm,
-        )
-        y_star = np.asarray(y_star)
-        C_star = np.asarray(C_star)
-        var = np.diag(C_star) if C_star.ndim == 2 else C_star
-        flux_out[j] = fill_edge_nans(y_star)
-        err_out[j] = np.sqrt(np.where(var < 0, 0.0, var))
-    return flux_out, err_out
+    return _frizzle_stack_arrays(
+        data["waves"][:, :, o], data["fluxs"][:, :, o], data["vars"][:, :, o],
+        data["bcvels"][:, o], w_out, n_modes=n_modes,
+    )
 
 
-def frizzle_stack_trace_all_orders(data, common_grid, n_modes=None, verbose=True):
-    """Run :func:`frizzle_stack_traces` for every order. Returns (nspec, norder, npix)."""
+def frizzle_stack_trace_all_orders(data, common_grid, n_modes=None,
+                                   nproc=1, verbose=True):
+    """
+    Frizzle-stack all traces for every order (see :func:`frizzle_stack_traces`).
+    Orders are processed in parallel over ``nproc`` workers. Returns
+    (nspec, norder, npix): flux_out, err_out.
+    """
     nspec, _, norder, npix = data["fluxs"].shape
     flux_out = np.empty((nspec, norder, npix))
     err_out = np.empty((nspec, norder, npix))
-    for o in range(norder):
-        fo, eo = frizzle_stack_traces(data, o, common_grid[o], n_modes=n_modes)
+
+    jobs = [
+        dict(o=o, n_modes=n_modes,
+             w=data["waves"][:, :, o], f=data["fluxs"][:, :, o],
+             v=data["vars"][:, :, o], bcvel=data["bcvels"][:, o],
+             w_out=common_grid[o])
+        for o in range(norder)
+    ]
+    for o, fo, eo in _map_orders(jobs, _frizzle_stack_job, nproc, verbose,
+                                 "frizzle-stacked order"):
         flux_out[:, o] = fo
         err_out[:, o] = eo
-        if verbose:
-            print(f"  frizzle-stacked order {o + 1}/{norder}")
     return flux_out, err_out
 
 
@@ -490,7 +606,7 @@ def parse_args(argv=None):
     )
     p.add_argument("--date", required=True, help="UT date, YYYYMMDD (e.g. 20240808)")
     p.add_argument(
-        "--method", default="spectres", choices=sorted(METHODS),
+        "--method", default="spectres", choices=sorted(METHOD_NAMES),
         help="resampling scheme (default: spectres)",
     )
     p.add_argument(
@@ -546,15 +662,28 @@ def parse_args(argv=None):
              "(default: ~npix/3, odd)",
     )
     p.add_argument(
+        "--nproc", type=int, default=1,
+        help="number of processes to parallelize the orders over; each order "
+             "is resampled independently, a batch of nproc at a time "
+             "(default: 1 = serial)",
+    )
+    p.add_argument(
         "--limit", type=int, default=None,
         help="process at most this many spectra (for quick tests)",
     )
 
     # Output
     p.add_argument(
+        "--outdir", default="outputs",
+        help="directory to write the output .npz into, created if missing; "
+             "ignored when --output is itself a path with a directory "
+             "(default: outputs)",
+    )
+    p.add_argument(
         "-o", "--output", default=None,
-        help="output .npz path "
-             "(default: socal_spectra_{date}_{trace}_{method}_common_wavegrid.npz)",
+        help="output .npz filename or path "
+             "(default: socal_spectra_{date}_{trace}_{method}_common_wavegrid.npz "
+             "inside --outdir)",
     )
     p.add_argument(
         "--save-errors", action="store_true",
@@ -583,6 +712,9 @@ def main(argv=None):
             data["fluxs"], data["vars"], percentile=args.norm_percentile
         )
 
+    if args.nproc > 1:
+        print(f"Parallelizing orders over {args.nproc} processes")
+
     if args.trace == "ALL":
         # Common grid = SCI1 wavelengths of the first epoch (as in the notebook).
         common_grid = data["waves"][0, TRACE_INDEX["SCI1"]]
@@ -592,19 +724,20 @@ def main(argv=None):
             # epoch/order); --method is not used for the combination.
             print(f"Trace: ALL   Combine: frizzle-stack")
             flux, err = frizzle_stack_trace_all_orders(
-                data, common_grid, n_modes=args.n_modes, verbose=verbose
+                data, common_grid, n_modes=args.n_modes,
+                nproc=args.nproc, verbose=verbose,
             )
         else:
             # Resample each trace with --method onto the common grid, then
             # flux-weight sum them per epoch.
-            resample = METHODS[args.method](args)
             print(f"Method: {args.method}   Trace: ALL   Combine: sum")
             flux_per_trace, err_per_trace = [], []
             for name in ("SCI1", "SCI2", "SCI3"):
                 t = TRACE_INDEX[name]
                 print(f"[{name}]")
                 fo, eo = shift_and_resample_trace(
-                    data, t, resample, common_grid, verbose=verbose
+                    data, t, args.method, common_grid, n_modes=args.n_modes,
+                    nproc=args.nproc, verbose=verbose,
                 )
                 flux_per_trace.append(fo)
                 err_per_trace.append(eo)
@@ -616,12 +749,12 @@ def main(argv=None):
                 e_traces = [err_per_trace[t][j] for t in range(NTRACE)]
                 flux[j], err[j] = combine_traces(f_traces, e_traces)
     else:
-        resample = METHODS[args.method](args)
         print(f"Method: {args.method}   Trace: {args.trace}")
         t = TRACE_INDEX[args.trace]
         common_grid = data["waves"][0, t]
         flux, err = shift_and_resample_trace(
-            data, t, resample, common_grid, verbose=verbose
+            data, t, args.method, common_grid, n_modes=args.n_modes,
+            nproc=args.nproc, verbose=verbose,
         )
 
     # ------------------------------------------------------------------
@@ -638,6 +771,13 @@ def main(argv=None):
         f"socal_spectra_{args.date}_{args.trace}_{scheme}"
         "_common_wavegrid.npz"
     )
+    # Place the file in --outdir unless the user gave --output with its own
+    # directory. Create whatever directory we end up writing into.
+    if os.path.dirname(output) == "":
+        output = os.path.join(args.outdir, output)
+    outdir = os.path.dirname(output)
+    if outdir:
+        os.makedirs(outdir, exist_ok=True)
     out = dict(
         wave=common_grid,
         flux=flux,
